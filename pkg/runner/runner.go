@@ -2,17 +2,19 @@ package runner
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 	"github.com/water-hole/ansible-operator/pkg/paramconv"
+	"github.com/water-hole/ansible-operator/pkg/runner/eventapi"
 	"github.com/water-hole/ansible-operator/pkg/runner/internal/inputdir"
 	yaml "gopkg.in/yaml.v2"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -21,7 +23,7 @@ import (
 // Runner - a runnable that should take the parameters and name and namespace
 // and run the correct code.
 type Runner interface {
-	Run(map[string]interface{}, string, string, string) (*StatusJobEvent, error)
+	Run(map[string]interface{}, string, string, string) (*eventapi.StatusJobEvent, error)
 }
 
 // watch holds data used to create a mapping of GVK to ansible playbook or role.
@@ -97,8 +99,11 @@ type runner struct {
 }
 
 // Run uses the runner with the given input and returns a status.
-func (r *runner) Run(parameters map[string]interface{}, name, namespace, kubeconfig string) (*StatusJobEvent, error) {
+func (r *runner) Run(parameters map[string]interface{}, name, namespace, kubeconfig string) (*eventapi.StatusJobEvent, error) {
 	parameters["meta"] = map[string]string{"namespace": namespace, "name": name}
+	ident := strconv.Itoa(rand.Int())
+	sockPath := fmt.Sprintf("/tmp/mysockPath-%s", ident)
+
 	inputDir := inputdir.InputDir{
 		Path:         filepath.Join("/tmp/ansible-operator/runner/", r.GVK.Group, r.GVK.Version, r.GVK.Kind, namespace, name),
 		PlaybookPath: r.Path,
@@ -106,44 +111,69 @@ func (r *runner) Run(parameters map[string]interface{}, name, namespace, kubecon
 		EnvVars: map[string]string{
 			"K8S_AUTH_KUBECONFIG": kubeconfig,
 		},
+		Settings: map[string]string{
+			"runner_http_url":  sockPath,
+			"runner_http_path": "/events/",
+		},
 	}
 	err := inputDir.Write()
 	if err != nil {
 		return nil, err
 	}
 
-	ident := strconv.Itoa(rand.Int())
+	// errChan gives both the http server and ansible-runner command, each of
+	// which runs in a goroutine, an opportunity to return an error and have it
+	// sent back to the control loop below.
+	errChan := make(chan error, 2)
+
+	receiver, err := eventapi.New(sockPath, "/events/", errChan)
+	if err != nil {
+		return nil, err
+	}
+	defer receiver.Close()
+
 	dc := r.cmdFunc(ident, inputDir.Path)
-	err = dc.Run()
-	if err != nil {
-		return nil, err
-	}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		localErr := dc.Run()
+		if localErr != nil {
+			logrus.Errorf("error for run %s: %s", ident, localErr.Error())
+		} else {
+			logrus.Infof("ansible-runner exited successfully for run %s", ident)
+		}
+		errChan <- localErr
+		wg.Done()
+	}()
+	// ensure ansible-runner exits before the http server gets closed
+	defer wg.Wait()
+	// once this function returns, immediately stop receiving events
+	defer receiver.Stop()
 
-	return jobStatus(inputDir.Path, ident)
-}
-
-// Status returns the final status from ansible-runner. The implementation will change to use an
-// event API instead of the filesystem inspection seen below.
-func jobStatus(path, ident string) (*StatusJobEvent, error) {
-	logrus.Infof("collecting results for run %v", ident)
-
-	eventFiles, err := ioutil.ReadDir(filepath.Join(path, "artifacts", ident, "job_events"))
-	if err != nil {
-		return nil, err
+	for {
+		select {
+		case event := <-receiver.Events:
+			if event.Event == "playbook_on_stats" {
+				// convert to StatusJobEvent; would love a better way to do this
+				data, err := json.Marshal(event)
+				if err != nil {
+					return nil, err
+				}
+				s := eventapi.StatusJobEvent{}
+				err = json.Unmarshal(data, &s)
+				if err != nil {
+					return nil, err
+				}
+				return &s, nil
+			}
+		case err = <-errChan:
+			// http.Server returns this in the case of being closed cleanly
+			if err == http.ErrServerClosed {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	if len(eventFiles) == 0 {
-		return nil, errors.New("Unable to read event data")
-	}
-	sort.Sort(fileInfos(eventFiles))
-	//get the last event, which should be a status.
-	d, err := ioutil.ReadFile(filepath.Join(path, "artifacts/", ident, "job_events", eventFiles[len(eventFiles)-1].Name()))
-	if err != nil {
-		return nil, err
-	}
-	o := &StatusJobEvent{}
-	err = json.Unmarshal(d, o)
-	if err != nil {
-		return nil, err
-	}
-	return o, nil
 }
