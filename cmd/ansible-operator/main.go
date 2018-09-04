@@ -11,6 +11,7 @@ import (
 	k8sutil "github.com/operator-framework/operator-sdk/pkg/util/k8sutil"
 	sdkVersion "github.com/operator-framework/operator-sdk/version"
 	handler "github.com/water-hole/ansible-operator/pkg/handler"
+	"github.com/water-hole/ansible-operator/pkg/leader"
 	proxy "github.com/water-hole/ansible-operator/pkg/proxy"
 	"github.com/water-hole/ansible-operator/pkg/runner"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,6 +30,11 @@ func printVersion() {
 
 func main() {
 	printVersion()
+	err := leader.Become("ansible-operator-lock")
+	if err != nil {
+		logrus.Fatal(err.Error())
+	}
+
 	done := make(chan error)
 
 	// start the proxy
@@ -41,7 +47,7 @@ func main() {
 	go runSDK(done)
 
 	// wait for either to finish
-	err := <-done
+	err = <-done
 	if err == nil {
 		logrus.Info("Exiting")
 	} else {
