@@ -30,7 +30,7 @@ func printVersion() {
 
 func main() {
 	printVersion()
-	err := leader.Become("ansible-operator-lock")
+	err := leader.TryBecome("ansible-operator-lock")
 	if err != nil {
 		logrus.Fatal(err.Error())
 	}

@@ -1,6 +1,7 @@
 package leader
 
 import (
+	"errors"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -14,6 +15,17 @@ import (
 
 	"github.com/sirupsen/logrus"
 )
+
+var ErrNoNS = errors.New("namespace not found for current environment")
+
+func TryBecome(name string) error {
+	err := Become(name)
+	if err == ErrNoNS {
+		logrus.Warn("leader election disabled; no namespace found for current environment")
+		return nil
+	}
+	return err
+}
 
 // Become ensures that the current pod is the leader within its namespace. It
 // continuously tries to create a ConfigMap with an agreed-upon name and the
@@ -88,6 +100,9 @@ func Become(name string) error {
 func myNS() (string, error) {
 	nsBytes, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrNoNS
+		}
 		return "", err
 	}
 	ns := strings.TrimSpace(string(nsBytes))
